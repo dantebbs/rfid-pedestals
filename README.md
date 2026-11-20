@@ -9,7 +9,9 @@ readers and reports tags to a PC over USB.
 * **CDC (virtual serial port):** debug telemetry and a configuration CLI.
 
 Tag type doesn't matter: anything the PN7160 can poll (ISO 14443A/B, ISO 15693,
-and FeliCa on old firmware) produces a UID.
+and FeliCa on old firmware) produces a UID. By default only ISO 14443A tags
+(NTAG, MIFARE) are polled, which keeps each reader's turn short; `set tech ABV`
+adds the others at the cost of slower response.
 
 ## Building and connecting
 
@@ -27,6 +29,10 @@ and FeliCa on old firmware) produces a UID.
    flip side is that uploads must go through the Programming port.
 4. The on-board **L** LED blinks once a second while the sketch is running. If
    it stops blinking, the sketch has hung.
+5. Optional run indicator: an LED on **pin 32** lights as soon as the sketch
+   starts and stays lit while it runs. Wire pin 32 → 330 Ω to 1 kΩ resistor →
+   LED anode, LED cathode → GND. Change `RUN_LED_PIN` in `RFID_Reader.ino` to use
+   another pin.
 
 ## Wiring
 
@@ -52,8 +58,9 @@ Every row can be changed from the CLI (`reader 5 bus 0`, `reader 3 irq 40`, ...)
   floating pin doesn't look like a waiting packet.
 * **VEN:** optional. With it wired, the firmware power-cycles a reader that stops
   answering. Without it, use `reader N ven none` and tie VEN high on the module.
-* **Long cables:** the default I2C clock is 100 kHz. Only raise it (`set i2c 400000`)
-  on short wiring.
+* **I2C clock:** the default is 20 kHz. Four PN7160 boards on one bus add more
+  capacitance than the chip's 100 pF rating, and at 100 kHz the readers stopped
+  answering. Only raise it (`set i2c <hz>`) with fewer boards or short wiring.
 
 ## Tag map
 
@@ -76,16 +83,17 @@ tag the map doesn't know is presented, it takes the next free tag column, so the
 first five different tags become tag1 to tag5. Tags beyond five send nothing.
 The keys are sent alone, without Enter.
 
-**Key tag.** Type `key learn` in the CLI, then present the tag you want as the
-key at any reader. The key tag never types anything. Presenting it twice within
-5 seconds (lift it off for at least the `remove` time, 0.5 s by default, in
-between) erases the map, and the next five new tags are learned in order.
+**Key tags.** Up to ten key tags, numbered 0 to 9. Type `key 0 learn` in the CLI
+(`tag 0 learn` works too), then present the tag you want as key 0 at any reader.
+Key tags never type anything. Presenting the same key tag twice within 5 seconds
+(lift it off for at least the `remove` time, 0.5 s by default, in between) erases
+the map, and the next five new tags are learned in order.
 
-The five tag IDs and the key tag are saved in flash as they are learned, so they
+The five tag IDs and the key tags are saved in flash as they are learned, so they
 survive power cycles. They're stored apart from the settings: `save`,
-`defaults` and `load` don't touch them. `map` shows the map and the learned tags,
-`map clear` erases the map, and `key clear` forgets the key tag. **Uploading a
-new sketch erases them** along with the settings.
+`defaults` and `load` don't touch them. `map` shows the map, the learned tags and
+the key tags, `map clear` erases the map, and `key 3 clear` forgets key tag 3.
+**Uploading a new sketch erases them** along with the settings.
 
 ## HID output
 
@@ -106,12 +114,18 @@ tag from R1 to R2 gives `1-…` then `2+…`.
 
 ## How detection works
 
-The PN7160 speaks NCI 2.0. Each reader polls; when it finds a tag the firmware
-records the UID, turns the RF field off for `rfoff` ms and restarts polling. A
-tag that stays put is therefore seen again every cycle (tens of milliseconds),
-and a tag that is removed simply stops being seen. After `remove` ms (default
-500) without a sighting, `<reader>-UID` is sent. Several tags on one reader are each
-tracked. A new tag is noticed within about one `poll` period (default 100 ms).
+The PN7160 speaks NCI 2.0. Once set up, every reader waits with its RF field
+off, and the readers take turns: only one field is ever on, which keeps the
+supply current down. On its turn a reader switches RF on and polls for `poll`
+ms (default 50). If it finds a tag it records the UID straight away. Either
+way it then switches RF off, and after `rfoff` ms (default 5) the next ready
+reader takes its turn. With the defaults, one round of four readers takes
+roughly 0.15 s.
+
+A tag that stays put is seen again on every turn, and a tag that is removed
+stops being seen. It is reported gone (`<reader>-UID`) once it has been
+missed for `remove` ms (default 300) or two full rounds, whichever is longer.
+Several tags on one reader are each tracked.
 
 ## CLI
 
@@ -128,14 +142,14 @@ reader <1-5> bus <0|1>
 reader <1-5> addr <hex>     0x28..0x2B
 reader <1-5> irq <pin>
 reader <1-5> ven <pin|none>
-set remove <ms>             unseen this long -> '-' event (default 500)
-set poll <ms>               PN7160 polling period (default 100)
-set rfoff <ms>              field-off gap between presence checks (default 20)
-set tech <letters>          any of A B F V (default ABV)
+set remove <ms>             unseen this long -> '-' event (default 300)
+set poll <ms>               RF-on time per reader turn (default 50)
+set rfoff <ms>              gap between one reader's RF off and the next one's on (default 5)
+set tech <letters>          any of A B F V (default A)
 map                         show the tag map and the learned tags
-map clear                   forget the 5 tags (key tag stays)
-key learn                   next tag presented at any reader becomes the key tag
-key clear                   forget the key tag
+map clear                   forget the 5 tags (key tags stay)
+key <0-9> learn             next tag presented at any reader becomes key tag 0-9
+key <0-9> clear             forget that key tag ('tag' works the same as 'key')
 set output <map|id>         HID sends a map key (default) or '<reader>+<UID>'
 set hid <kb|raw|both|off>
 set enter <on|off>          id output: press Enter after each line
@@ -149,6 +163,60 @@ nci <1-5> <hex bytes>       send a raw NCI packet (debug)
 
 Disable readers you haven't connected (`reader 5 off`, then `save`) to keep
 the log quiet. They're retried every 10 s otherwise.
+
+## Staying up: the watchdog
+
+The Due core's USB interrupt code waits forever in several places for the PC to
+answer. If the PC stops in the middle of a USB request (sleep, USB power saving,
+a port reset), the chip freezes inside that interrupt: the HID and CDC devices
+disappear from the PC and only the Programming port (a separate chip) is left.
+
+The sketch therefore runs the SAM3X hardware watchdog. The loop feeds it on every
+pass, and if the loop stops for 8 seconds the board restarts and the native port
+comes back by itself (reopen the terminal afterwards). `status` shows the uptime,
+whether the watchdog is on, and why the board last started, for example
+`watchdog (the loop froze, last in USB service)` or `reset pin (RESET button or
+Programming port opened)`. The same line is printed when the CLI starts.
+
+The USB link is watched as well, because it has also been lost while the loop
+kept running. Once the PC has set the board up, if the PC stops sending USB
+frames or leaves the board unconfigured for 10 seconds, the board disconnects from
+USB and restarts, so the PC finds it again as a new device. It only does this
+after the PC has set it up once, so a PC that is asleep or off doesn't cause
+repeated restarts. The last-reset line then reads `USB link lost (...)`, and
+`status` counts how often the PC stopped sending frames or unconfigured the board.
+
+**Log on the Programming port.** Everything the log prints also goes out on the
+Programming port at 115200 baud. Opening that port restarts the board, so open it
+first, then leave the terminal running: if the native port drops, the lines
+leading up to it are there (`USB: PC stopped sending frames`, `USB: no longer
+configured`, ...).
+
+**Two firmware races that dropped the native port (fixed).** Both are between
+the main loop and the core's USB interrupt, and could happen while the board sat
+idle:
+
+1. *Endpoint repair during a bus reset.* The core switches the serial and HID
+   endpoints off whenever it rejects a USB request, so `usbService()` switches
+   them back on. A USB bus reset from the PC also switches them off, about
+   10 ms before the core notices the reset. The repair used to run inside that
+   window and re-enable the endpoints in the middle of the reset, so they came
+   out of it in a state the PC hadn't set up, and re-enumeration could fail.
+   The repair now waits until the PC has sent a frame since the endpoints went
+   off (the PC sends none during a reset) and re-checks with interrupts off.
+2. *Check, then send.* Serial and HID output checked that the endpoint was
+   free, then called the core's send, which waits forever for the endpoint.
+   If the USB interrupt switched the endpoint off between the two, the loop
+   froze. Sends now go through `usbSendPacket()`, which checks and writes the
+   packet in one step with interrupts off and never waits.
+
+`status` shows how often the endpoints were repaired.
+
+**USB trace.** The sketch records every USB bus reset, every control request
+the PC sends (and whether the core rejected it), and suspend/resume. When the
+PC un-configures the board, and again just before a restart, the log prints
+these events as `USB trace` lines on both ports. If the PC has given up on
+the board (unconfigured and no frames), it restarts after 1 s rather than 10 s.
 
 ## Troubleshooting: board shows up as "Bossa Program Port"
 
@@ -203,6 +271,7 @@ sketch has to be uploaded again through the Programming port.
 | `HidOut.*` | HID descriptor, keyboard typing, raw reports |
 | `UsbOut.*` | USB sends that drop data instead of blocking when the PC isn't reading |
 | `Cli.*` | serial command line |
+| `Health.*` | watchdog, crash capture, last-reset reason |
 | `Config.*` | settings and flash storage |
 | `Log.*` | telemetry output |
 

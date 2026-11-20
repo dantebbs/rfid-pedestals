@@ -1,6 +1,17 @@
 #include "Log.h"
 #include <stdarg.h>
 
+LogTee logTee;
+
+size_t LogTee::write(const uint8_t* data, size_t len) {
+  usbOut.write(data, len);
+  // The UART always drains (115200 baud, nothing to wait for on the other
+  // side), so waiting for buffer room is short and bounded. Dropping instead
+  // cut lines short in the log, which is the copy that matters when USB drops.
+  Serial.write(data, len);
+  return len;
+}
+
 static void stamp() {
   uint32_t ms = millis();
   char buf[16];

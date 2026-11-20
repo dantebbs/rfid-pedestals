@@ -14,14 +14,53 @@ static const uint8_t NFC_F_POLL = 0x02;
 static const uint8_t NFC_V_POLL = 0x06;
 
 static const uint16_t VEN_LOW_MS = 20;      // datasheet minimum is 10 us
-static const uint16_t BOOT_MS = 10;         // datasheet tboot is 2.5 ms max
+// Datasheet tboot is 2.5 ms max, but module boards often put an RC filter on
+// VEN, so the chip starts later than the pin goes high.
+static const uint16_t BOOT_MS = 50;
 static const uint16_t CMD_TIMEOUT_MS = 500;
 static const uint16_t RESET_TIMEOUT_MS = 1000;
+// CORE_RESET is re-sent this often before giving up: a chip still booting
+// ACKs its I2C address but drops the command (NXP's driver also retries).
+static const uint16_t RESET_RETRY_MS = 250;
+static const uint8_t RESET_TRIES = 4;
 static const uint16_t DEACT_NTF_WAIT_MS = 200;
 static const uint32_t BACKOFF_MIN_MS = 500;
 static const uint32_t BACKOFF_MAX_MS = 10000;
 
+Pn7160Reader* Pn7160Reader::all_[MAX_READERS] = {};
+int8_t Pn7160Reader::rfOwner_ = -1;
+uint8_t Pn7160Reader::lastTurn_ = MAX_READERS - 1;
+uint32_t Pn7160Reader::rfFreeSince_ = 0;
+
+uint32_t sensorRoundMs() {
+  uint32_t longest = 0;
+  for (uint8_t i = 0; i < MAX_READERS; i++) {
+    Pn7160Reader* r = Pn7160Reader::all_[i];
+    if (r && r->ready_ && r->roundMs_ > longest) longest = r->roundMs_;
+  }
+  return longest;
+}
+
+// The next turn goes to the first reader after the last one to have a turn
+// that is ready and waiting with RF off.
+bool Pn7160Reader::myTurn() const {
+  for (uint8_t k = 1; k <= MAX_READERS; k++) {
+    uint8_t i = (lastTurn_ + k) % MAX_READERS;
+    Pn7160Reader* r = all_[i];
+    if (r && r->state_ == ST_RF_OFF) return r == this;
+  }
+  return false;
+}
+
+void Pn7160Reader::releaseRf() {
+  if (rfOwner_ == (int8_t)index_) {
+    rfOwner_ = -1;
+    rfFreeSince_ = millis();
+  }
+}
+
 void Pn7160Reader::begin(uint8_t index, ReaderConfig* rc, TagSeenFn onSeen) {
+  all_[index] = this;
   index_ = index;
   rc_ = rc;
   onSeen_ = onSeen;
@@ -51,10 +90,11 @@ void Pn7160Reader::enter(State s, uint16_t timeoutMs) {
   state_ = s;
   stateSince_ = millis();
   timeoutMs_ = timeoutMs;
-  if (s == ST_DISCOVERING) {
+  if (s == ST_DISCOVERING || s == ST_RF_OFF) {
     ready_ = true;
   } else if (s < ST_W4_DISCOVER_RSP || s == ST_BACKOFF) {
     ready_ = false;
+    releaseRf();  // an error or reset ends this reader's turn
   }
 
   bool on = online();
@@ -95,7 +135,10 @@ void Pn7160Reader::fail(const char* why) {
        (unsigned long)backoffMs_);
   if (wasOnline_) logf(LOG_EVENT, "R%u offline", index_ + 1);
 
-  if (rc_->venPin >= 0) digitalWrite(rc_->venPin, LOW);
+  // VEN stays high during the backoff; the retry pulses it low for only
+  // VEN_LOW_MS. Readers share a bus, and holding one chip powered down for
+  // the whole backoff (up to 10 s) could drag down the bus the other readers
+  // were trying to use, so one failing reader kept all of them failing.
   enter(ST_BACKOFF, (uint16_t)backoffMs_);
   backoffMs_ = min(backoffMs_ * 2, BACKOFF_MAX_MS);
 }
@@ -103,17 +146,44 @@ void Pn7160Reader::fail(const char* why) {
 // IRQ is a level, not an edge: it stays high while the PN7160 has a packet
 // waiting and drops once the packet has been read. Polling the level means a
 // busy loop can never "miss" an interrupt.
+//
+// With "irq none" there is no IRQ line, so the chip is simply asked every
+// IRQ_POLL_MS: a read it NACKs (or answers with an empty 0xFF header) just
+// means nothing is waiting.
+static const uint32_t IRQ_POLL_MS = 5;
+
 bool Pn7160Reader::irqActive() {
-  if (rc_->irqPin < 0) return false;
-  return digitalRead(rc_->irqPin) == HIGH;
+  if (rc_->irqPin >= 0) return digitalRead(rc_->irqPin) == HIGH;
+  uint32_t t = millis();
+  if (t - lastPollMs_ < IRQ_POLL_MS) return false;
+  lastPollMs_ = t;
+  return true;
 }
 
 // NXP's reference driver reads the 3-byte NCI header and then the payload
 // in a second transfer; the PN7160 expects exactly that.
 bool Pn7160Reader::receive() {
-  if (!bus_->read(rc_->addr, rx_, 3)) return false;
+  noData_ = false;
+  bool polled = rc_->irqPin < 0;
+  uint32_t errorsBefore = bus_->errors;
+  if (!bus_->read(rc_->addr, rx_, 3)) {
+    if (polled) {  // NACK: nothing waiting
+      bus_->errors = errorsBefore;
+      noData_ = true;
+    }
+    return false;
+  }
   uint8_t mt = rx_[0] >> 5;
   if (mt != MT_DATA && mt != MT_RSP && mt != MT_NTF) {
+    if (polled) {
+      noData_ = true;
+      if (logOn(LOG_TRACE) && !(rx_[0] == 0xFF && rx_[1] == 0xFF && rx_[2] == 0xFF)) {
+        char prefix[16];
+        snprintf(prefix, sizeof(prefix), "R%u << junk", index_ + 1);
+        logHex(LOG_TRACE, prefix, rx_, 3);
+      }
+      return false;
+    }
     logHex(LOG_INFO, "bad NCI header:", rx_, 3);
     return false;
   }
@@ -236,6 +306,7 @@ void Pn7160Reader::service(uint32_t nowMs) {
   if (state_ != ST_POWER_DOWN && state_ != ST_BACKOFF) {
     for (uint8_t n = 0; n < 4 && irqActive(); n++) {
       if (!receive()) {
+        if (noData_) break;
         fail("I2C read failed");
         return;
       }
@@ -250,7 +321,11 @@ void Pn7160Reader::service(uint32_t nowMs) {
   uint32_t elapsed = millis() - stateSince_;
   switch (state_) {
     case ST_DISABLED:
+      break;
     case ST_DISCOVERING:
+      // One poll period is a full sweep of every enabled technology. Nothing
+      // found: RF off and hand the turn on.
+      if (elapsed >= cfg.pollPeriodMs) sendDeactivate(false);
       break;
     case ST_POWER_DOWN:
       if (elapsed >= VEN_LOW_MS) {
@@ -259,13 +334,37 @@ void Pn7160Reader::service(uint32_t nowMs) {
       }
       break;
     case ST_BOOT:
-      if (elapsed >= BOOT_MS) sendCoreReset();
+      if (elapsed >= BOOT_MS) {
+        resetTries_ = 1;
+        sendCoreReset();
+      }
       break;
-    case ST_RF_OFF:
-      if (elapsed >= cfg.rfOffMs && (!deactNtfExpected_ || gotDeactNtf_ || elapsed >= DEACT_NTF_WAIT_MS)) {
+    case ST_W4_RESET_RSP:
+      if (elapsed >= RESET_RETRY_MS && resetTries_ < RESET_TRIES) {
+        resetTries_++;
+        logf(LOG_DEBUG, "R%u no reply to CORE_RESET, sending it again", index_ + 1);
+        sendCoreReset();
+      } else if (elapsed >= RESET_RETRY_MS) {
+        fail("no answer from reader");
+      }
+      break;
+    case ST_RF_OFF: {
+      // The turn ends once the chip has confirmed RF is off.
+      if (rfOwner_ == (int8_t)index_ && (!deactNtfExpected_ || gotDeactNtf_ || elapsed >= DEACT_NTF_WAIT_MS)) {
+        releaseRf();
+      }
+      // rfoff: pause between one reader's field going off and the next
+      // one's going on.
+      uint32_t t = millis();
+      if (rfOwner_ < 0 && t - rfFreeSince_ >= cfg.rfOffMs && myTurn()) {
+        rfOwner_ = index_;
+        lastTurn_ = index_;
+        if (turnStart_) roundMs_ = t - turnStart_;
+        turnStart_ = t;
         sendDiscover();
       }
       break;
+    }
     case ST_BACKOFF:
       if (elapsed >= timeoutMs_) powerCycle();
       break;
@@ -320,7 +419,8 @@ void Pn7160Reader::onResponse(uint8_t status) {
       break;
     case ST_W4_MAP_RSP:
       if (status) logf(LOG_INFO, "R%u RF_DISCOVER_MAP status %02X", index_ + 1, status);
-      sendDiscover();
+      deactNtfExpected_ = false;
+      enter(ST_RF_OFF);  // ready, RF off: wait for a turn
       break;
     case ST_W4_DISCOVER_RSP:
       if (status) return fail("RF_DISCOVER rejected (check 'set tech')");
@@ -443,7 +543,7 @@ const char* Pn7160Reader::stateName(State s) {
     case ST_W4_DISCOVER_RSP: return "wait DISCOVER_RSP";
     case ST_DISCOVERING: return "discovering";
     case ST_W4_DEACTIVATE_RSP: return "wait DEACTIVATE_RSP";
-    case ST_RF_OFF: return "rf-off";
+    case ST_RF_OFF: return "ready, RF off";
     case ST_BACKOFF: return "backoff";
   }
   return "?";
@@ -457,9 +557,13 @@ void Pn7160Reader::printStatus(Print& out) {
   } else {
     strcpy(ven, "none");
   }
-  snprintf(line, sizeof(line), "R%u %-3s bus %u addr 0x%02X irq %d ven %-4s  %-8s %-20s", index_ + 1,
-           rc_->enabled ? "on" : "off", rc_->bus, rc_->addr, rc_->irqPin, ven, online() ? "ONLINE" : "offline",
-           stateName(state_));
+  // The IRQ level shows wiring faults: with no packet waiting it must read
+  // low. "high" while idle means the pin is floating or wired to another
+  // reader, and every reading it triggers fails.
+  snprintf(line, sizeof(line), "R%u %-3s bus %u addr 0x%02X irq %d (%s) ven %-4s  %-8s %-20s", index_ + 1,
+           rc_->enabled ? "on" : "off", rc_->bus, rc_->addr, rc_->irqPin,
+           rc_->irqPin < 0 ? "polled" : (digitalRead(rc_->irqPin) == HIGH ? "high" : "low"), ven,
+           online() ? "ONLINE" : "offline", stateName(state_));
   out.print(line);
   if (model_) {
     snprintf(line, sizeof(line), "  %s fw %02X.%02X.%02X", model_ == 0x71 ? "PN7161" : "PN7160", fw_[0], fw_[1],

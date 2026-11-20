@@ -36,16 +36,18 @@ void configDefaults(Config& c) {
   };
   memcpy(c.reader, defaults, sizeof(defaults));
 
-  c.removeMs = 500;
-  c.pollPeriodMs = 100;
-  c.rfOffMs = 20;
-  c.techMask = TECH_A | TECH_B | TECH_V;
+  // Tuned on the installation (2026-11-19): ISO 14443A tags only, short RF
+  // turns, so four readers take turns in about 0.15 s.
+  c.removeMs = 300;
+  c.pollPeriodMs = 50;
+  c.rfOffMs = 5;
+  c.techMask = TECH_A;
   c.hidMode = HID_KEYBOARD;
   c.outputMode = OUT_MAP;
   c.hidEnter = 1;
   c.kbDelayMs = 2;
   c.logLevel = LOG_INFO;
-  c.i2cHz = 100000;
+  c.i2cHz = 20000;  // 100 kHz failed with four PN7160 boards on bus 0 (bus capacitance)
 }
 
 static uint32_t crc32(const uint8_t* d, size_t n) {

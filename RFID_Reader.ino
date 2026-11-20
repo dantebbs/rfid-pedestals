@@ -21,6 +21,7 @@
 #include "HidOut.h"
 #include "Cli.h"
 #include "UsbOut.h"
+#include "Health.h"
 
 // To use a different reader chip, implement TagSensor (TagSensor.h) and
 // change this declaration.
@@ -49,8 +50,17 @@ static void onTagEvent(bool appeared, uint8_t reader, const char* uidHex) {
   }
 }
 
+// Run indicator: an external LED (through a resistor to GND) on this pin
+// lights when the sketch starts and stays lit while it runs.
+static const uint8_t RUN_LED_PIN = 32;
+
 void setup() {
+  healthBegin();
+  pinMode(RUN_LED_PIN, OUTPUT);
+  digitalWrite(RUN_LED_PIN, HIGH);
   SerialUSB.begin(115200);
+  Serial.begin(115200);  // Programming port: copy of the log
+  usbTraceBegin();  // record USB resets and requests for the log
   pinMode(LED_BUILTIN, OUTPUT);
   bool loaded = configLoad();
 
@@ -61,7 +71,8 @@ void setup() {
     sensors[i]->begin(i, &cfg.reader[i], onTagSeen);
   }
 
-  logf(LOG_EVENT, "RFID Reader started, %s config. Type 'help' for commands.", loaded ? "saved" : "default");
+  logf(LOG_EVENT, "RFID Reader started, %s config. Last reset: %s. Type 'help' for commands.",
+       loaded ? "saved" : "default", healthResetText());
 }
 
 // The Due core treats "Native port opened at 1200 baud, then closed" as a
@@ -89,10 +100,19 @@ static void heartbeat(uint32_t now) {
 
 void loop() {
   uint32_t now = millis();
+  healthStage(STAGE_HEARTBEAT);
   heartbeat(now);
+  healthStage(STAGE_USB);
   usbService();
+  healthStage(STAGE_CLI);
   cliService();
-  for (uint8_t i = 0; i < MAX_READERS; i++) sensors[i]->service(now);
+  for (uint8_t i = 0; i < MAX_READERS; i++) {
+    healthStage(STAGE_READERS + i);
+    sensors[i]->service(now);
+  }
+  healthStage(STAGE_TRACKER);
   trackerService(now);
+  healthStage(STAGE_HID);
   hidService(now);
+  healthService(now);  // feeds the watchdog and watches the USB link
 }

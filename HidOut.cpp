@@ -109,13 +109,22 @@ static void queueLine(const char* line, bool enter) {
   }
 }
 
-// Every HID().SendReport() below is preceded by usbInReady(): the core's
-// send blocks until the host takes the report, which froze the sketch.
+// Reports go out through usbSendPacket(), never HID().SendReport(): the
+// core's send waits forever if the endpoint is switched off between our
+// check and the send (bus reset or stalled request in the USB interrupt).
 static bool hidReady() { return usbInReady(usbHidEndpoint()); }
 
-static void sendKey(uint8_t mod, uint8_t key) {
+static bool sendReport(uint8_t id, const void* data, size_t len) {
+  uint8_t p[64];
+  if (len + 1 > sizeof(p)) return false;
+  p[0] = id;
+  memcpy(p + 1, data, len);
+  return usbSendPacket(usbHidEndpoint(), p, len + 1);
+}
+
+static bool sendKey(uint8_t mod, uint8_t key) {
   uint8_t report[8] = {mod, 0, key, 0, 0, 0, 0, 0};
-  HID().SendReport(REPORT_KEYBOARD, report, sizeof(report));
+  return sendReport(REPORT_KEYBOARD, report, sizeof(report));
 }
 
 // Raw reports wait here for a free endpoint instead of blocking.
@@ -150,7 +159,7 @@ void hidService(uint32_t nowMs) {
   lastProgressMs = nowMs;
 
   if (rawCount) {  // raw reports are single packets: send at once
-    HID().SendReport(REPORT_RAW, rawQueue[rawHead], RAW_SIZE);
+    if (!sendReport(REPORT_RAW, rawQueue[rawHead], RAW_SIZE)) return;  // retry next loop
     rawHead = (rawHead + 1) % RAW_QUEUE;
     rawCount--;
     return;
@@ -159,18 +168,18 @@ void hidService(uint32_t nowMs) {
   if (nowMs - lastReportMs < cfg.kbDelayMs) return;
   lastReportMs = nowMs;
   if (keyDown) {  // every key is released before the next is pressed
-    sendKey(0, 0);
+    if (!sendKey(0, 0)) return;
     keyDown = false;
     return;
   }
   if (qHead == qTail) return;
   char c = queue[qHead];
-  qHead = (qHead + 1) % sizeof(queue);
   uint8_t mod, key;
   if (asciiToKey(c, mod, key)) {
-    sendKey(mod, key);
+    if (!sendKey(mod, key)) return;  // not taken: try the same key next loop
     keyDown = true;
   }
+  qHead = (qHead + 1) % sizeof(queue);
 }
 
 // ---- Raw reports ---------------------------------------------------------

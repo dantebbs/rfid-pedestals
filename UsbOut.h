@@ -8,8 +8,14 @@
 #include <Arduino.h>
 
 // True when IN endpoint `ep` has a free bank, so one packet of up to 64
-// bytes can be handed to USBD_Send() without waiting.
+// bytes can be sent now. Only a hint: use usbSendPacket() to send.
 bool usbInReady(uint32_t ep);
+
+// Sends one packet (up to 64 bytes) on IN endpoint `ep` if, at that very
+// moment, the endpoint is enabled and has a free bank; otherwise sends
+// nothing and returns false. Never waits. Use this instead of USBD_Send()
+// or HID().SendReport(), which wait forever if the endpoint goes away.
+bool usbSendPacket(uint32_t ep, const uint8_t* data, size_t len);
 
 uint32_t usbCdcEndpoint();
 uint32_t usbHidEndpoint();
@@ -22,7 +28,13 @@ uint32_t usbHidEndpoint();
 // program on the PC opens or enumerates the port. Call every loop(): it puts
 // the endpoints back the way SET_CONFIGURATION left them.
 void usbService();
-extern uint32_t usbRepairs;  // how often the endpoints had to be restored
+extern uint32_t usbRepairs;
+
+// USB event trace (bus resets, the PC's control requests, suspend/resume).
+// usbTraceBegin() in setup(), after SerialUSB.begin(); usbTraceLog() prints
+// the events recorded since it last ran.
+void usbTraceBegin();
+void usbTraceLog();  // how often the endpoints had to be restored
 
 // Output side of the CDC port (input still comes from SerialUSB). Writes
 // short packets straight to the endpoint, whether or not the terminal has

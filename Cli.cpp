@@ -6,6 +6,7 @@
 #include "TagSensor.h"
 #include "TagTracker.h"
 #include "TagMap.h"
+#include "Health.h"
 
 #define CLI usbOut  // output; input is read from SerialUSB directly
 
@@ -18,22 +19,22 @@ static const char HELP[] =
     "  reader <1-5> on|off\n"
     "  reader <1-5> bus <0|1>      0 = SDA/SCL (pins 20/21), 1 = SDA1/SCL1\n"
     "  reader <1-5> addr <hex>     0x28..0x2B, set by the HIF1/HIF2 pins\n"
-    "  reader <1-5> irq <pin>\n"
+    "  reader <1-5> irq <pin|none>  none: no IRQ wire, poll the reader\n"
     "  reader <1-5> ven <pin|none>\n"
-    "  set remove <ms>             unseen this long -> '-' event (default 500)\n"
-    "  set poll <ms>               PN7160 polling period (default 100)\n"
-    "  set rfoff <ms>              field-off gap between presence checks (default 20)\n"
-    "  set tech <letters>          any of A B F V (default ABV; F = FeliCa, old firmware only)\n"
+    "  set remove <ms>             unseen this long -> '-' event (default 300; at least 2 scan rounds)\n"
+    "  set poll <ms>               RF-on time per reader turn (default 50)\n"
+    "  set rfoff <ms>              gap between one reader's RF off and the next one's on (default 5)\n"
+    "  set tech <letters>          any of A B F V (default A; F = FeliCa, old firmware only)\n"
     "  map                         show the tag map and the learned tags\n"
-    "  map clear                   forget the 5 tags (key tag stays)\n"
-    "  key learn                   next tag presented at any reader becomes the key tag\n"
-    "  key clear                   forget the key tag\n"
+    "  map clear                   forget the 5 tags (key tags stay)\n"
+    "  key <0-9> learn             next tag presented at any reader becomes key tag 0-9\n"
+    "  key <0-9> clear             forget that key tag ('tag' works the same as 'key')\n"
     "  set output <map|id>         HID sends a map key (default) or '<reader>+<UID>'\n"
     "  set hid <kb|raw|both|off>   keyboard typing and/or vendor reports (default kb)\n"
     "  set enter <on|off>          id output: press Enter after each line (default on)\n"
     "  set kbdelay <ms>            keyboard: gap between key reports (default 2)\n"
     "  set log <0-4>               0 off, 1 events, 2 info, 3 debug, 4 NCI trace\n"
-    "  set i2c <hz>                I2C clock, 100000 or 400000\n"
+    "  set i2c <hz>                I2C clock, 10000..400000 (default 20000)\n"
     "  save | load | defaults\n"
     "  hidtest <text>              send text over HID as if it were an event\n"
     "  nci <1-5> <hex bytes>       send a raw NCI packet (debug; see 'set log 4')\n";
@@ -103,6 +104,12 @@ static void cmdStatus() {
            USBDevice.configured() ? "configured" : "not configured", (unsigned long)usbOut.dropped,
            (unsigned long)usbRepairs);
   CLI.println(buf);
+  uint32_t s = millis() / 1000;
+  snprintf(buf, sizeof(buf), "Up %lu h %02lu m %02lu s; watchdog %s; last reset: ", (unsigned long)(s / 3600),
+           (unsigned long)(s / 60 % 60), (unsigned long)(s % 60), healthWatchdogOn() ? "on" : "OFF");
+  CLI.print(buf);
+  CLI.println(healthResetText());
+  healthPrintUsb(CLI);
 }
 
 static void cmdScan() {
@@ -124,6 +131,7 @@ static void cmdScan() {
     CLI.print(":");
     uint8_t found = 0;
     for (uint8_t a = 0x08; a < 0x78; a++) {
+      healthKick();  // a bus without pull-ups makes this take seconds
       if (bus.probe(a)) {
         char buf[8];
         snprintf(buf, sizeof(buf), " 0x%02X", a);
@@ -155,6 +163,8 @@ static void cmdReader(char* args[], int argc) {
   } else if (!strcasecmp(what, "addr") && parseNum(val, 0x08, 0x77, n)) {
     if (n < 0x28 || n > 0x2B) CLI.println("note: the PN7160 only answers at 0x28..0x2B");
     rc.addr = n;
+  } else if (!strcasecmp(what, "irq") && val && !strcasecmp(val, "none")) {
+    rc.irqPin = -1;
   } else if (!strcasecmp(what, "irq") && parseNum(val, 0, 78, n)) {
     rc.irqPin = n;
   } else if (!strcasecmp(what, "ven") && val && !strcasecmp(val, "none")) {
@@ -249,6 +259,32 @@ static void cmdNci(char* args[], int argc) {
   if (!sensors[r]->sendRaw(pkt, n)) CLI.println("reader not ready");
 }
 
+// key <0-9> learn | key <0-9> clear | key (list). "tag" works the same.
+// The index may also come after the verb: "key learn 3".
+static void cmdKey(char* args[], int argc) {
+  if (argc == 1) { tagMapPrint(CLI); return; }
+  long slot = -1;
+  const char* verb = nullptr;
+  for (int i = 1; i < argc && i < 3; i++) {
+    long n;
+    if (parseNum(args[i], 0, MAP_KEYS - 1, n)) slot = n;
+    else verb = args[i];
+  }
+  if (slot < 0 || !verb || (strcasecmp(verb, "learn") && strcasecmp(verb, "clear"))) {
+    CLI.println("usage: key <0-9> learn | key <0-9> clear");
+    return;
+  }
+  char msg[48];
+  if (!strcasecmp(verb, "learn")) {
+    tagMapLearnKey(slot);
+    snprintf(msg, sizeof(msg), "present key tag %ld at any reader", slot);
+  } else {
+    tagMapForgetKey(slot);
+    snprintf(msg, sizeof(msg), "key tag %ld forgotten", slot);
+  }
+  CLI.println(msg);
+}
+
 static void execute(char* text) {
   char* args[24];
   int argc = 0;
@@ -299,16 +335,8 @@ static void execute(char* text) {
   } else if (!strcasecmp(cmd, "map")) {
     if (argc > 1 && !strcasecmp(args[1], "clear")) tagMapClear();
     else tagMapPrint(CLI);
-  } else if (!strcasecmp(cmd, "key")) {
-    if (argc > 1 && !strcasecmp(args[1], "learn")) {
-      tagMapLearnKey();
-      CLI.println("present the key tag at any reader");
-    } else if (argc > 1 && !strcasecmp(args[1], "clear")) {
-      tagMapForgetKey();
-      CLI.println("key tag forgotten");
-    } else {
-      CLI.println("usage: key learn | key clear");
-    }
+  } else if (!strcasecmp(cmd, "key") || !strcasecmp(cmd, "tag")) {
+    cmdKey(args, argc);
   } else if (!strcasecmp(cmd, "nci")) {
     cmdNci(args, argc);
   } else {
@@ -333,6 +361,8 @@ void cliService() {
       lineLen = 0;
       CLI.println();
       CLI.println("RFID Reader ready. Type 'help' for commands.");
+      CLI.print("Last reset: ");
+      CLI.println(healthResetText());
     }
     bool crlf = (c == '\n' && prev == '\r');
     prev = c;

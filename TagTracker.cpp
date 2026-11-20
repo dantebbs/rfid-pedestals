@@ -1,4 +1,5 @@
 #include "TagTracker.h"
+#include "TagSensor.h"
 #include "Log.h"
 
 static const uint8_t MAX_TAGS = 24;
@@ -61,9 +62,13 @@ void trackerSeen(uint8_t reader, const uint8_t* uid, uint8_t len) {
 }
 
 void trackerService(uint32_t nowMs) {
+  // Readers take turns, so a tag is only checked once per round.
+  uint32_t removeAfter = cfg.removeMs;
+  uint32_t twoRounds = 2 * sensorRoundMs() + 50;
+  if (twoRounds > removeAfter) removeAfter = twoRounds;
   for (Entry& e : tags) {
     // Signed: a reader may have stamped a sighting after nowMs was taken.
-    if (e.used && (int32_t)(nowMs - e.lastSeen) >= (int32_t)cfg.removeMs) {
+    if (e.used && (int32_t)(nowMs - e.lastSeen) >= (int32_t)removeAfter) {
       e.used = false;
       emit(false, e);
     }

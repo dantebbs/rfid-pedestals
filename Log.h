@@ -1,10 +1,20 @@
-// Debug telemetry on the native USB CDC port (SerialUSB).
+// Debug telemetry, sent to both the native USB CDC port (SerialUSB) and the
+// Programming port (Serial, 115200 baud). The Programming port copy keeps
+// working when the native USB link is lost, so a terminal left open on it
+// records what happened.
 #pragma once
 #include <Arduino.h>
 #include "Config.h"
 #include "UsbOut.h"
 
-#define LOG_PORT usbOut
+class LogTee : public Print {
+ public:
+  size_t write(uint8_t c) override { return write(&c, 1); }
+  size_t write(const uint8_t* data, size_t len) override;
+  using Print::write;
+};
+extern LogTee logTee;
+#define LOG_PORT logTee
 
 inline bool logOn(uint8_t level) { return level <= cfg.logLevel; }
 

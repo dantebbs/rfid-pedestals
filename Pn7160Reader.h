@@ -1,10 +1,13 @@
 // NXP PN7160/PN7161 NFC controller over I2C, spoken to in NCI 2.0.
 //
-// Presence detection: the reader polls; when a tag is found the PN7160
-// reports it (RF_INTF_ACTIVATED_NTF for one tag, RF_DISCOVER_NTF for each of
-// several), we record the UID, switch the RF field off briefly and restart
-// discovery. A tag that stays in the field is therefore seen again every
-// cycle, whatever its type, and a tag that leaves simply stops being seen.
+// Presence detection, one reader at a time: every initialised reader waits
+// with its RF field off. The readers take turns: the one whose turn it is
+// starts discovery (RF on), and either reports a tag (RF_INTF_ACTIVATED_NTF
+// for one tag, RF_DISCOVER_NTF for each of several) or finds nothing within
+// one poll period; either way it switches RF off again and hands the turn
+// on. Only one field is ever on, which keeps the supply current low. A tag
+// that stays in the field is seen again on every turn, whatever its type,
+// and a tag that leaves simply stops being seen.
 #pragma once
 #include "TagSensor.h"
 #include "I2CBus.h"
@@ -31,9 +34,9 @@ class Pn7160Reader : public TagSensor {
     ST_W4_CONFIG_RSP,
     ST_W4_MAP_RSP,
     ST_W4_DISCOVER_RSP,
-    ST_DISCOVERING,  // polling; nothing to do until a tag shows up
+    ST_DISCOVERING,  // RF on, this reader's turn: waiting for a tag
     ST_W4_DEACTIVATE_RSP,
-    ST_RF_OFF,       // field off between presence checks
+    ST_RF_OFF,       // ready, RF off, waiting for this reader's turn
     ST_BACKOFF,      // after an error, before the next power cycle
   };
 
@@ -43,6 +46,9 @@ class Pn7160Reader : public TagSensor {
   void fail(const char* why);
 
   bool irqActive();
+  uint8_t resetTries_ = 0;   // CORE_RESET sends since this boot
+  uint32_t lastPollMs_ = 0;  // "irq none": when the chip was last asked
+  bool noData_ = false;      // last receive() found nothing waiting (polled mode)
   bool receive();
   bool send(const uint8_t* pkt, uint8_t len);
   bool command(const uint8_t* pkt, uint8_t len, State next, uint16_t timeoutMs);
@@ -61,6 +67,17 @@ class Pn7160Reader : public TagSensor {
   void reportTag(uint8_t techMode, const uint8_t* tp, uint8_t tpLen);
 
   static const char* stateName(State s);
+
+  // RF turn-taking shared by all readers.
+  bool myTurn() const;
+  void releaseRf();
+  static Pn7160Reader* all_[MAX_READERS];
+  static int8_t rfOwner_;      // reader whose field is on, -1 if none
+  static uint8_t lastTurn_;    // reader that had the last turn
+  static uint32_t rfFreeSince_;
+  uint32_t turnStart_ = 0;     // when this reader's last turn began
+  uint32_t roundMs_ = 0;       // time between this reader's last two turns
+  friend uint32_t sensorRoundMs();
 
   uint8_t index_ = 0;
   ReaderConfig* rc_ = nullptr;

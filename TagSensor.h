@@ -20,4 +20,9 @@ class TagSensor {
   virtual bool sendRaw(const uint8_t* pkt, uint8_t len) { return false; }  // debug, optional
 };
 
-extern TagSensor* sensors[MAX_READERS];  // defined in RFID_Reader.ino
+extern TagSensor* sensors[MAX_READERS];
+
+// How long one round of turns currently takes (the longest gap between two
+// turns of the same reader). A tag is only declared gone once it has been
+// missed for at least two rounds.
+uint32_t sensorRoundMs();  // defined in RFID_Reader.ino
